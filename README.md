@@ -1,6 +1,8 @@
 # PRAGMA Reproduction
 
-This workspace contains a clean-room PyTorch implementation of the core PRAGMA recipe from the Revolut paper:
+This repo contains a clean-room PyTorch implementation of the core PRAGMA recipe from the Revolut paper.
+
+## What Is Here
 
 - key-value-time tokenization for profile state and event histories
 - shared key/value embeddings with within-field positional encodings
@@ -8,24 +10,23 @@ This workspace contains a clean-room PyTorch implementation of the core PRAGMA r
 - mixed masking for MLM pretraining
 - LoRA adapters over QKV and MLP projections for downstream tuning
 
-The implementation is intentionally dependency-light so it can run in a fresh workspace. That means a few production details from the paper are approximated rather than copied verbatim:
+The implementation is intentionally dependency-light so it can run in a fresh workspace. A few production details from the paper are approximated rather than copied verbatim:
 
-- it uses padded attention instead of FlashAttention varlen kernels
-- it uses a small in-repo BPE-style tokenizer instead of an external tokenizer package
-- the exact categorical threshold, numeric bucket count, and `[UNK]` replacement rate are configurable because the paper does not publish those values
-- the data layer uses in-memory records and JSON-friendly schemas instead of the paper's LMDB plus Parquet sharding stack
+- padded attention is used instead of FlashAttention varlen kernels
+- the tokenizer is implemented in-repo instead of depending on an external tokenizer stack
+- categorical thresholds, numeric bucket counts, and `[UNK]` replacement rates are configurable because the paper does not publish exact values
+- the data layer uses in-memory records instead of the paper's LMDB plus Parquet sharding layout
 
-## Layout
+## Folder Structure
 
-- `pragma_repro/config.py`: model and tokenizer presets, including PRAGMA-S/M/L
-- `pragma_repro/records.py`: dataset schema
-- `pragma_repro/tokenizer.py`: schema inference, vocab building, tokenization, collation
-- `pragma_repro/model.py`: PRAGMA-style backbone and MLM head
-- `pragma_repro/lora.py`: LoRA injection utilities
-- `pragma_repro/synthetic.py`: synthetic transactional dataset generator
-- `scripts/pretrain_synthetic.py`: tiny MLM pretraining run
-- `scripts/finetune_synthetic.py`: tiny downstream LoRA run
-- `scripts/smoke_test.py`: one forward pass and one optimizer step
+- `environment.yml`: Conda environment definition
+- `config.yaml`: shared runtime, training, and inference settings
+- `src/config.py`: model presets plus YAML config loading helpers
+- `src/data/`: records, tokenization, masking, JSON I/O, and synthetic data generation
+- `src/modeling/`: backbone and LoRA modules
+- `src/tests/`: smoke-level execution checks
+- `scripts/`: training and inference entrypoints
+- `research/`: local paper notes and ignored research assets
 
 ## Record Schema
 
@@ -40,13 +41,27 @@ Each training example is a `UserRecord` with:
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install torch numpy
-python scripts/smoke_test.py
-python scripts/pretrain_synthetic.py --steps 20
-python scripts/finetune_synthetic.py --steps 20
+conda env create -f environment.yml
+conda activate pragma-opensource
+python src/tests/smoke_test.py
+python scripts/train.py --config config.yaml --task pretrain
+python scripts/train.py --config config.yaml --task finetune
+python scripts/infer.py --config config.yaml
 ```
+
+## Config-Driven Workflow
+
+`config.yaml` is the single control surface for:
+
+- runtime device and random seed
+- dataset source and synthetic dataset size
+- tokenizer settings
+- model variant and dropout
+- pretraining hyperparameters and output paths
+- finetuning and LoRA settings
+- inference checkpoint paths and prediction output
+
+That means you can change batch size, model size, output locations, or checkpoint paths without editing Python files.
 
 ## Paper-Faithful Defaults
 

@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from .bpe import BPETokenizer
-from .config import MaskingConfig, TokenizerConfig
+from config import MaskingConfig, TokenizerConfig
 from .masking import build_mlm_inputs
 from .records import UserRecord, ensure_list, parse_timestamp
 

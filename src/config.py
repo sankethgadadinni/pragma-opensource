@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
 
 
 @dataclass(slots=True)
@@ -110,3 +114,22 @@ def make_model_config(
         label_smoothing=label_smoothing,
     )
 
+
+def load_yaml_config(path: str | Path) -> dict[str, Any]:
+    payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected top-level mapping in {path!s}.")
+    return payload
+
+
+def tokenizer_config_from_dict(payload: dict[str, Any] | None = None) -> TokenizerConfig:
+    data = dict(payload or {})
+    if "force_categorical_fields" in data:
+        data["force_categorical_fields"] = tuple(data["force_categorical_fields"])
+    return TokenizerConfig(**data)
+
+
+def masking_config_from_dict(payload: dict[str, Any] | None = None) -> MaskingConfig:
+    return MaskingConfig(**dict(payload or {}))

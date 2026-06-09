@@ -1,0 +1,75 @@
+runtime:
+  seed: 0
+  device: auto
+
+data:
+  source: synthetic
+  records_json: null
+  num_records: 256
+  train_fraction: 0.8
+  synthetic_seed: 0
+  min_events: 16
+  max_events: 72
+
+tokenizer:
+  categorical_threshold: 128
+  numeric_bucket_count: 64
+  text_vocab_size: 4096
+  bpe_min_frequency: 2
+  max_event_tokens: 24
+  max_profile_tokens: 200
+  max_events: 6500
+  force_categorical_fields:
+    - balance_quantile
+    - channel
+    - country
+    - currency
+    - direction
+    - merchant
+    - mcc
+    - plan
+    - service_region
+    - symbol
+    - type
+
+masking:
+  token_mask_probability: 0.15
+  event_mask_probability: 0.10
+  key_mask_probability: 0.10
+  unk_probability: 0.10
+  label_smoothing: 0.1
+
+model:
+  variant: S
+  dropout: 0.1
+
+pretrain:
+  batch_size: 8
+  steps: 20
+  learning_rate: 0.0003
+  output_dir: artifacts/pretrain
+
+finetune:
+  batch_size: 8
+  steps: 20
+  learning_rate: 0.0002
+  output_dir: artifacts/finetune
+  pooling: usr_last
+  num_outputs: 1
+  pretrained_backbone_path: artifacts/pretrain/backbone.pt
+  tokenizer_path: artifacts/pretrain/tokenizer.json
+
+lora:
+  rank: 8
+  alpha: 8
+  dropout: 0.0
+
+inference:
+  checkpoint_path: artifacts/finetune/classifier.pt
+  tokenizer_path: artifacts/finetune/tokenizer.json
+  input_json: null
+  num_examples: 5
+  synthetic_seed: 7
+  num_records: 16
+  threshold: 0.5
+  prediction_output: artifacts/inference/predictions.json

@@ -6,13 +6,14 @@ from pathlib import Path
 import torch
 from torch.nn import functional as F
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+SRC = Path(__file__).resolve().parents[1]
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-from pragma_repro import PragmaBackbone, PragmaClassifier, PragmaTokenizer, TokenizerConfig, make_model_config
-from pragma_repro.lora import LoRAConfig, freeze_non_lora_parameters, inject_lora
-from pragma_repro.synthetic import generate_synthetic_records
+from config import TokenizerConfig, make_model_config
+from data import PragmaTokenizer, generate_synthetic_records
+from modeling import PragmaBackbone, PragmaClassifier
+from modeling.lora import LoRAConfig, freeze_non_lora_parameters, inject_lora
 
 
 def main() -> None:

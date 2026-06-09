@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .config import MaskingConfig
+from config import MaskingConfig
 
 
 def build_mlm_inputs(

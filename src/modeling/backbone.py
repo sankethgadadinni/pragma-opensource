@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .config import ModelConfig
-from .tokenizer import PragmaBatch
+from config import ModelConfig
+from data.tokenizer import PragmaBatch
 
 
 def sinusoidal_embedding(indices: torch.Tensor, dim: int) -> torch.Tensor:
