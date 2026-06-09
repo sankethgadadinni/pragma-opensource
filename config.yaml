@@ -5,6 +5,7 @@ runtime:
 data:
   source: synthetic
   records_json: null
+  sharded_store_dir: artifacts/pretrain_store
   num_records: 256
   train_fraction: 0.8
   synthetic_seed: 0
@@ -39,6 +40,18 @@ masking:
   unk_probability: 0.10
   label_smoothing: 0.1
 
+text_encoder:
+  enabled: false
+  provider: hash
+  model_name: null
+  output_dim: 384
+  max_length: 128
+  local_files_only: true
+  placeholder_token: "[TEXT]"
+  target_fields:
+    - description
+  text_loss_weight: 1.0
+
 model:
   variant: S
   dropout: 0.1
@@ -47,15 +60,28 @@ pretrain:
   batch_size: 8
   steps: 20
   learning_rate: 0.0003
+  adamw_learning_rate: 0.0003
+  optimizer: muon_adamw
+  precision: bf16
+  token_budget: 8192
+  use_sharded_store: true
+  sharded_store_dir: artifacts/pretrain_store
+  rebuild_sharded_store: false
+  parquet_compression: zstd
+  use_sequence_packing: true
+  weight_decay: 0.01
+  muon_momentum: 0.95
   output_dir: artifacts/pretrain
 
 finetune:
   batch_size: 8
   steps: 20
   learning_rate: 0.0002
+  precision: fp32
   output_dir: artifacts/finetune
   pooling: usr_last
   num_outputs: 1
+  task_type: binary
   pretrained_backbone_path: artifacts/pretrain/backbone.pt
   tokenizer_path: artifacts/pretrain/tokenizer.json
 
@@ -67,9 +93,27 @@ lora:
 inference:
   checkpoint_path: artifacts/finetune/classifier.pt
   tokenizer_path: artifacts/finetune/tokenizer.json
+  source: synthetic
   input_json: null
+  sharded_store_dir: null
+  task_type: binary
   num_examples: 5
   synthetic_seed: 7
   num_records: 16
   threshold: 0.5
   prediction_output: artifacts/inference/predictions.json
+
+probe:
+  backbone_path: artifacts/pretrain/backbone.pt
+  tokenizer_path: artifacts/pretrain/tokenizer.json
+  source: synthetic
+  input_json: null
+  sharded_store_dir: null
+  task_type: binary
+  pooling: usr_last
+  batch_size: 32
+  max_iter: 128
+  num_outputs: 1
+  synthetic_seed: 11
+  num_records: 256
+  output_path: artifacts/probe/results.json

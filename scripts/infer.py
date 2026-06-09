@@ -12,7 +12,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from config import load_yaml_config, make_model_config  # noqa: E402
-from data import PragmaTokenizer, generate_synthetic_records, load_user_records, save_json  # noqa: E402
+from data import (  # noqa: E402
+    PragmaTokenizer,
+    ShardedRecordStore,
+    generate_synthetic_records,
+    load_user_records,
+    save_json,
+)
 from modeling import PragmaBackbone, PragmaClassifier  # noqa: E402
 from modeling.lora import LoRAConfig, inject_lora  # noqa: E402
 
@@ -36,9 +42,17 @@ def resolve_path(path_like: str | Path) -> Path:
 
 def load_records(config: dict):
     inference = config.get("inference", {})
-    input_json = inference.get("input_json")
-    if input_json:
+    data_source = str(inference.get("source", config.get("data", {}).get("source", "synthetic")))
+    if data_source == "json":
+        input_json = inference.get("input_json")
+        if not input_json:
+            raise ValueError("inference.input_json must be set when inference.source=json.")
         return load_user_records(resolve_path(input_json))
+    if data_source == "sharded":
+        sharded_store_dir = inference.get("sharded_store_dir", config.get("data", {}).get("sharded_store_dir"))
+        if not sharded_store_dir:
+            raise ValueError("A sharded store directory is required for inference.source=sharded.")
+        return ShardedRecordStore(resolve_path(sharded_store_dir)).load_all_records()
     return generate_synthetic_records(
         int(inference.get("num_records", 16)),
         seed=int(inference.get("synthetic_seed", 7)),
@@ -52,7 +66,11 @@ def main() -> None:
     device = resolve_device(str(config.get("runtime", {}).get("device", "auto")))
 
     tokenizer = PragmaTokenizer.load(resolve_path(inference.get("tokenizer_path", "artifacts/finetune/tokenizer.json")))
-    checkpoint = torch.load(resolve_path(inference.get("checkpoint_path", "artifacts/finetune/classifier.pt")), map_location=device)
+    checkpoint = torch.load(
+        resolve_path(inference.get("checkpoint_path", "artifacts/finetune/classifier.pt")),
+        map_location=device,
+        weights_only=False,
+    )
 
     backbone = PragmaBackbone(
         make_model_config(
@@ -61,6 +79,8 @@ def main() -> None:
             dropout=float(checkpoint.get("dropout", config.get("model", {}).get("dropout", 0.1))),
             label_smoothing=float(checkpoint.get("label_smoothing", tokenizer.masking_config.label_smoothing)),
             max_event_tokens=int(checkpoint.get("max_event_tokens", tokenizer.config.max_event_tokens)),
+            text_encoder_dim=int(checkpoint.get("text_encoder_dim", tokenizer.text_embedding_dim)),
+            text_loss_weight=float(checkpoint.get("text_loss_weight", config.get("text_encoder", {}).get("text_loss_weight", 1.0))),
         )
     ).to(device)
     inject_lora(
@@ -77,38 +97,59 @@ def main() -> None:
         pooling=str(checkpoint.get("pooling", "usr_last")),
         dropout=float(checkpoint.get("dropout", config.get("model", {}).get("dropout", 0.1))),
     ).to(device)
-    classifier.load_state_dict(checkpoint["state_dict"])
+    classifier.load_state_dict(checkpoint["state_dict"], strict=False)
     classifier.eval()
 
     records = load_records(config)
     num_examples = int(inference.get("num_examples", 5))
     threshold = float(inference.get("threshold", 0.5))
+    task_type = str(inference.get("task_type", checkpoint.get("task_type", "binary"))).lower()
     batch = tokenizer.collate(records[:num_examples], apply_mlm=False, device=device)
 
     with torch.no_grad():
         logits = classifier(batch)
-        if logits.ndim == 1:
-            scores = torch.sigmoid(logits).tolist()
+        if task_type in {"binary", "ranking"}:
+            scores = torch.sigmoid(logits).detach().cpu()
         else:
-            scores = torch.sigmoid(logits).tolist()
+            scores = logits.detach().cpu()
 
     predictions = []
-    if scores and isinstance(scores[0], list):
-        for record, score in zip(records[:num_examples], scores):
-            predictions.append(
-                {
-                    "user_id": record.user_id,
-                    "scores": score,
-                    "label": record.label,
-                }
-            )
-    else:
-        for record, score in zip(records[:num_examples], scores):
+    if task_type == "binary":
+        for record, score in zip(records[:num_examples], scores.tolist()):
             predictions.append(
                 {
                     "user_id": record.user_id,
                     "score": float(score),
                     "prediction": int(score >= threshold),
+                    "label": record.label,
+                }
+            )
+    elif task_type == "regression":
+        for record, value in zip(records[:num_examples], scores.tolist()):
+            predictions.append(
+                {
+                    "user_id": record.user_id,
+                    "prediction": float(value),
+                    "label": record.label,
+                }
+            )
+    elif task_type == "multiclass":
+        for record, values in zip(records[:num_examples], scores.tolist()):
+            predicted_class = int(max(range(len(values)), key=lambda idx: values[idx]))
+            predictions.append(
+                {
+                    "user_id": record.user_id,
+                    "logits": values,
+                    "prediction": predicted_class,
+                    "label": record.label,
+                }
+            )
+    else:
+        for record, values in zip(records[:num_examples], scores.tolist()):
+            predictions.append(
+                {
+                    "user_id": record.user_id,
+                    "scores": values,
                     "label": record.label,
                 }
             )

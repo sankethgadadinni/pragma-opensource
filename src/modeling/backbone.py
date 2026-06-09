@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
@@ -204,6 +205,8 @@ class PretrainOutput:
     loss: torch.Tensor
     logits: torch.Tensor
     masked_targets: torch.Tensor
+    token_loss: torch.Tensor
+    text_loss: torch.Tensor
     backbone: BackboneOutput
 
 
@@ -239,6 +242,11 @@ class PragmaBackbone(nn.Module):
         )
         self.calendar_encoder = CalendarFeatureEncoder(config.d_model, config.dropout)
         self.mlm_projection = nn.Linear(3 * config.d_model, config.d_model)
+        self.external_text_projection: nn.Linear | None = None
+        self.mlm_text_projection: nn.Linear | None = None
+        if config.text_encoder_dim > 0:
+            self.external_text_projection = nn.Linear(config.text_encoder_dim, config.d_model)
+            self.mlm_text_projection = nn.Linear(3 * config.d_model, config.text_encoder_dim)
 
     def embed_pairs(
         self,
@@ -247,9 +255,19 @@ class PragmaBackbone(nn.Module):
         value_positions: torch.Tensor,
         *,
         token_mask: torch.Tensor | None = None,
+        text_mask: torch.Tensor | None = None,
+        text_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
         key_embed = self.token_embedding(key_ids)
         value_embed = self.token_embedding(value_ids)
+        if (
+            self.external_text_projection is not None
+            and text_mask is not None
+            and text_embeddings is not None
+            and text_mask.any()
+        ):
+            projected = self.external_text_projection(text_embeddings.to(key_embed.dtype))
+            value_embed = torch.where(text_mask.unsqueeze(-1), projected, value_embed)
         position_embed = sinusoidal_embedding(value_positions, self.config.d_model).to(key_embed.dtype)
         hidden = key_embed + value_embed + position_embed
         hidden = self.embedding_dropout(hidden)
@@ -257,15 +275,72 @@ class PragmaBackbone(nn.Module):
             hidden = hidden * token_mask.unsqueeze(-1)
         return hidden
 
+    def encode_packed_events(
+        self,
+        packed_tokens: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = packed_tokens.device
+        if packed_tokens.numel() == 0 or lengths.numel() == 0:
+            return (
+                packed_tokens.new_zeros((0, self.config.d_model)),
+                packed_tokens.new_zeros((0, self.config.d_model)),
+            )
+
+        offsets = [0]
+        for length in lengths.tolist():
+            offsets.append(offsets[-1] + int(length))
+
+        local_token_output = packed_tokens.new_zeros((packed_tokens.shape[0], self.config.d_model))
+        event_output = packed_tokens.new_zeros((lengths.shape[0], self.config.d_model))
+        grouped_indices: dict[int, list[int]] = defaultdict(list)
+        for event_index, length in enumerate(lengths.tolist()):
+            grouped_indices[int(length)].append(event_index)
+
+        for length, event_indices in grouped_indices.items():
+            token_batches = torch.stack(
+                [packed_tokens[offsets[i] : offsets[i + 1]] for i in event_indices],
+                dim=0,
+            )
+            valid_token_mask = torch.ones(
+                (len(event_indices), length),
+                dtype=torch.bool,
+                device=device,
+            )
+            evt_token = self.evt_token.view(1, 1, -1).expand(len(event_indices), 1, -1)
+            event_inputs = torch.cat([evt_token, token_batches], dim=1)
+            event_valid_mask = torch.cat(
+                [
+                    torch.ones((len(event_indices), 1), dtype=torch.bool, device=device),
+                    valid_token_mask,
+                ],
+                dim=1,
+            )
+            event_sequence = self.event_encoder(event_inputs, valid_mask=event_valid_mask)
+            event_output.index_copy_(
+                0,
+                torch.tensor(event_indices, dtype=torch.long, device=device),
+                event_sequence[:, 0, :],
+            )
+            for row_index, event_index in enumerate(event_indices):
+                start = offsets[event_index]
+                end = offsets[event_index + 1]
+                local_token_output[start:end] = event_sequence[row_index, 1:, :]
+        return local_token_output, event_output
+
     def encode(self, batch: PragmaBatch, *, use_masked_values: bool = True) -> BackboneOutput:
         device = batch.profile_key_ids.device
-        value_ids = batch.masked_event_value_ids if use_masked_values else batch.event_value_ids
+        event_value_ids = batch.masked_event_value_ids if use_masked_values else batch.event_value_ids
+        if event_value_ids is None or batch.event_key_ids is None or batch.event_value_positions is None:
+            raise ValueError("Event tensors are required for backbone encoding.")
 
         profile_tokens = self.embed_pairs(
             batch.profile_key_ids,
             batch.profile_value_ids,
             batch.profile_value_positions,
             token_mask=batch.profile_token_mask,
+            text_mask=batch.profile_text_mask,
+            text_embeddings=batch.profile_text_embeddings,
         )
         batch_size = profile_tokens.shape[0]
         usr_token = self.usr_token.view(1, 1, -1).expand(batch_size, 1, -1)
@@ -291,43 +366,75 @@ class PragmaBackbone(nn.Module):
         )
         user_embedding = profile_sequence[:, :1, :]
 
-        batch_size, event_count, event_token_count = value_ids.shape
-        event_tokens = self.embed_pairs(
-            batch.event_key_ids,
-            value_ids,
-            batch.event_value_positions,
-            token_mask=batch.event_token_mask,
-        )
-        flat_event_tokens = event_tokens.view(batch_size * event_count, event_token_count, -1)
-        flat_token_mask = batch.event_token_mask.view(batch_size * event_count, event_token_count)
-        flat_event_mask = batch.event_mask.view(batch_size * event_count)
+        batch_size, event_count, event_token_count = event_value_ids.shape
+        local_event_tokens = profile_tokens.new_zeros(batch_size, event_count, event_token_count, self.config.d_model)
+        event_embeddings = profile_tokens.new_zeros(batch_size, event_count, self.config.d_model)
 
-        local_event_tokens = event_tokens.new_zeros(batch_size * event_count, event_token_count, self.config.d_model)
-        event_embeddings = event_tokens.new_zeros(batch_size * event_count, self.config.d_model)
-        if flat_event_mask.any():
-            valid_indices = flat_event_mask.nonzero(as_tuple=False).squeeze(-1)
-            valid_tokens = flat_event_tokens.index_select(0, valid_indices)
-            valid_token_mask = flat_token_mask.index_select(0, valid_indices)
-            evt_token = self.evt_token.view(1, 1, -1).expand(valid_tokens.shape[0], 1, -1)
-            event_inputs = torch.cat([evt_token, valid_tokens], dim=1)
-            event_valid_mask = torch.cat(
-                [
-                    torch.ones((valid_tokens.shape[0], 1), dtype=torch.bool, device=device),
-                    valid_token_mask,
-                ],
-                dim=1,
-            )
-            event_sequence = self.event_encoder(event_inputs, valid_mask=event_valid_mask)
-            calendar_embeddings = self.calendar_encoder(
-                batch.event_calendar_features.view(batch_size * event_count, 6).index_select(0, valid_indices)
-            )
-            local_event_tokens.index_copy_(0, valid_indices, event_sequence[:, 1:, :])
-            event_embeddings.index_copy_(0, valid_indices, event_sequence[:, 0, :] + calendar_embeddings)
-
-        local_event_tokens = local_event_tokens.view(
-            batch_size, event_count, event_token_count, self.config.d_model
-        )
-        event_embeddings = event_embeddings.view(batch_size, event_count, self.config.d_model)
+        if batch.event_mask is not None and batch.event_mask.any():
+            if (
+                batch.packed_event_lengths is not None
+                and batch.packed_event_lengths.numel() > 0
+                and batch.packed_event_key_ids is not None
+                and batch.packed_event_value_positions is not None
+            ):
+                packed_value_ids = (
+                    batch.packed_masked_event_value_ids if use_masked_values else batch.packed_event_value_ids
+                )
+                if packed_value_ids is None:
+                    raise ValueError("Packed event value ids are required for packed encoding.")
+                packed_event_tokens = self.embed_pairs(
+                    batch.packed_event_key_ids,
+                    packed_value_ids,
+                    batch.packed_event_value_positions,
+                    text_mask=batch.packed_event_text_mask,
+                    text_embeddings=batch.packed_event_text_embeddings,
+                )
+                flat_local_tokens, flat_event_embeddings = self.encode_packed_events(
+                    packed_event_tokens,
+                    batch.packed_event_lengths,
+                )
+                local_event_tokens[batch.event_token_mask] = flat_local_tokens
+                calendar_embeddings = self.calendar_encoder(batch.event_calendar_features[batch.event_mask])
+                event_embeddings[batch.event_mask] = flat_event_embeddings + calendar_embeddings
+            else:
+                event_tokens = self.embed_pairs(
+                    batch.event_key_ids,
+                    event_value_ids,
+                    batch.event_value_positions,
+                    token_mask=batch.event_token_mask,
+                    text_mask=batch.event_text_mask,
+                    text_embeddings=batch.event_text_embeddings,
+                )
+                flat_event_tokens = event_tokens.view(batch_size * event_count, event_token_count, -1)
+                flat_token_mask = batch.event_token_mask.view(batch_size * event_count, event_token_count)
+                flat_event_mask = batch.event_mask.view(batch_size * event_count)
+                flat_local_tokens = event_tokens.new_zeros(
+                    batch_size * event_count,
+                    event_token_count,
+                    self.config.d_model,
+                )
+                flat_event_embeddings = event_tokens.new_zeros(batch_size * event_count, self.config.d_model)
+                if flat_event_mask.any():
+                    valid_indices = flat_event_mask.nonzero(as_tuple=False).squeeze(-1)
+                    valid_tokens = flat_event_tokens.index_select(0, valid_indices)
+                    valid_token_mask = flat_token_mask.index_select(0, valid_indices)
+                    evt_token = self.evt_token.view(1, 1, -1).expand(valid_tokens.shape[0], 1, -1)
+                    event_inputs = torch.cat([evt_token, valid_tokens], dim=1)
+                    event_valid_mask = torch.cat(
+                        [
+                            torch.ones((valid_tokens.shape[0], 1), dtype=torch.bool, device=device),
+                            valid_token_mask,
+                        ],
+                        dim=1,
+                    )
+                    event_sequence = self.event_encoder(event_inputs, valid_mask=event_valid_mask)
+                    calendar_embeddings = self.calendar_encoder(
+                        batch.event_calendar_features.view(batch_size * event_count, 6).index_select(0, valid_indices)
+                    )
+                    flat_local_tokens.index_copy_(0, valid_indices, event_sequence[:, 1:, :])
+                    flat_event_embeddings.index_copy_(0, valid_indices, event_sequence[:, 0, :] + calendar_embeddings)
+                local_event_tokens = flat_local_tokens.view(batch_size, event_count, event_token_count, self.config.d_model)
+                event_embeddings = flat_event_embeddings.view(batch_size, event_count, self.config.d_model)
 
         history_inputs = torch.cat([user_embedding, event_embeddings], dim=1)
         history_valid_mask = torch.cat(
@@ -358,36 +465,66 @@ class PragmaBackbone(nn.Module):
         )
 
     def forward_pretrain(self, batch: PragmaBatch) -> PretrainOutput:
+        if batch.mlm_labels is None:
+            raise ValueError("MLM labels are required for pretraining.")
         backbone = self.encode(batch, use_masked_values=True)
-        mask = batch.mlm_labels >= 0
-        targets = batch.mlm_labels[mask]
-        if mask.any():
-            history_event_embeddings = backbone.history_embeddings[:, 1:, :]
-            user_context = backbone.history_embeddings[:, :1, :]
-            event_context = history_event_embeddings.unsqueeze(2).expand_as(backbone.local_event_tokens)
-            user_context = user_context.unsqueeze(2).expand(
-                -1,
-                backbone.local_event_tokens.shape[1],
-                backbone.local_event_tokens.shape[2],
-                -1,
-            )
-            combined = torch.cat(
-                [backbone.local_event_tokens, event_context, user_context],
-                dim=-1,
-            )
-            masked_hidden = combined[mask]
-            projected = self.mlm_projection(masked_hidden)
+        token_mask = batch.mlm_labels >= 0
+        text_mask = batch.mlm_text_target_mask
+        has_text_targets = text_mask is not None and bool(text_mask.any().item())
+
+        history_event_embeddings = backbone.history_embeddings[:, 1:, :]
+        user_context = backbone.history_embeddings[:, :1, :]
+        event_context = history_event_embeddings.unsqueeze(2).expand_as(backbone.local_event_tokens)
+        user_context = user_context.unsqueeze(2).expand(
+            -1,
+            backbone.local_event_tokens.shape[1],
+            backbone.local_event_tokens.shape[2],
+            -1,
+        )
+        combined = torch.cat(
+            [backbone.local_event_tokens, event_context, user_context],
+            dim=-1,
+        )
+
+        token_loss = backbone.history_embeddings.sum() * 0.0
+        text_loss = backbone.history_embeddings.sum() * 0.0
+        logits = backbone.history_embeddings.new_zeros((0, self.config.vocab_size))
+        targets = batch.mlm_labels.new_zeros((0,), dtype=torch.long)
+
+        if token_mask.any():
+            targets = batch.mlm_labels[token_mask]
+            projected = self.mlm_projection(combined[token_mask])
             logits = projected @ self.token_embedding.weight.t()
-            loss = F.cross_entropy(
+            token_loss = F.cross_entropy(
                 logits,
                 targets,
                 label_smoothing=self.config.label_smoothing,
             )
+
+        if has_text_targets:
+            if self.mlm_text_projection is None or batch.mlm_text_targets is None:
+                raise RuntimeError("Text MLM targets exist but the text projection head is missing.")
+            predicted_text = self.mlm_text_projection(combined[text_mask])
+            target_text = batch.mlm_text_targets[text_mask].to(predicted_text.dtype)
+            text_loss = F.mse_loss(predicted_text, target_text)
+
+        if token_mask.any() and has_text_targets:
+            loss = token_loss + self.config.text_loss_weight * text_loss
+        elif token_mask.any():
+            loss = token_loss
+        elif has_text_targets:
+            loss = self.config.text_loss_weight * text_loss
         else:
-            logits = backbone.history_embeddings.new_zeros((0, self.config.vocab_size))
-            targets = batch.mlm_labels.new_zeros((0,), dtype=torch.long)
             loss = backbone.history_embeddings.sum() * 0.0
-        return PretrainOutput(loss=loss, logits=logits, masked_targets=targets, backbone=backbone)
+
+        return PretrainOutput(
+            loss=loss,
+            logits=logits,
+            masked_targets=targets,
+            token_loss=token_loss.detach(),
+            text_loss=text_loss.detach(),
+            backbone=backbone,
+        )
 
     def pooled_embedding(self, batch: PragmaBatch, history_embeddings: torch.Tensor, mode: str = "usr_last") -> torch.Tensor:
         user_embedding = history_embeddings[:, 0, :]

@@ -10,10 +10,17 @@ from typing import Any
 
 import torch
 
+from config import (
+    MaskingConfig,
+    TextEncoderConfig,
+    TokenizerConfig,
+    text_encoder_config_from_dict,
+)
+
 from .bpe import BPETokenizer
-from config import MaskingConfig, TokenizerConfig
 from .masking import build_mlm_inputs
 from .records import UserRecord, ensure_list, parse_timestamp
+from .text_encoder import FrozenTextEncoder, build_text_encoder
 
 
 def _is_numeric_scalar(value: Any) -> bool:
@@ -107,6 +114,7 @@ class TokenizedEvent:
     key_ids: list[int]
     value_ids: list[int]
     value_positions: list[int]
+    text_values: list[str | None]
     history_time: float
     calendar_features: list[float]
 
@@ -117,6 +125,7 @@ class TokenizedRecord:
     profile_key_ids: list[int]
     profile_value_ids: list[int]
     profile_value_positions: list[int]
+    profile_text_values: list[str | None]
     profile_times: list[float]
     events: list[TokenizedEvent]
     label: Any = None
@@ -129,15 +138,28 @@ class PragmaBatch:
     profile_value_positions: torch.Tensor
     profile_times: torch.Tensor
     profile_token_mask: torch.Tensor
-    event_key_ids: torch.Tensor
-    event_value_ids: torch.Tensor
-    masked_event_value_ids: torch.Tensor
-    event_value_positions: torch.Tensor
-    event_history_times: torch.Tensor
-    event_calendar_features: torch.Tensor
-    event_token_mask: torch.Tensor
-    event_mask: torch.Tensor
-    mlm_labels: torch.Tensor
+    profile_text_mask: torch.Tensor | None = None
+    profile_text_embeddings: torch.Tensor | None = None
+    event_key_ids: torch.Tensor | None = None
+    event_value_ids: torch.Tensor | None = None
+    masked_event_value_ids: torch.Tensor | None = None
+    event_value_positions: torch.Tensor | None = None
+    event_history_times: torch.Tensor | None = None
+    event_calendar_features: torch.Tensor | None = None
+    event_token_mask: torch.Tensor | None = None
+    event_mask: torch.Tensor | None = None
+    event_text_mask: torch.Tensor | None = None
+    event_text_embeddings: torch.Tensor | None = None
+    packed_event_key_ids: torch.Tensor | None = None
+    packed_event_value_ids: torch.Tensor | None = None
+    packed_masked_event_value_ids: torch.Tensor | None = None
+    packed_event_value_positions: torch.Tensor | None = None
+    packed_event_lengths: torch.Tensor | None = None
+    packed_event_text_mask: torch.Tensor | None = None
+    packed_event_text_embeddings: torch.Tensor | None = None
+    mlm_labels: torch.Tensor | None = None
+    mlm_text_target_mask: torch.Tensor | None = None
+    mlm_text_targets: torch.Tensor | None = None
     downstream_labels: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> "PragmaBatch":
@@ -157,9 +179,12 @@ class PragmaTokenizer:
         self,
         config: TokenizerConfig | None = None,
         masking_config: MaskingConfig | None = None,
+        text_encoder_config: TextEncoderConfig | None = None,
+        text_encoder: FrozenTextEncoder | None = None,
     ) -> None:
         self.config = config or TokenizerConfig()
         self.masking_config = masking_config or MaskingConfig()
+        self.text_encoder_config = text_encoder_config or TextEncoderConfig()
         self.vocab = Vocabulary(
             [
                 self.masking_config.pad_token,
@@ -170,12 +195,17 @@ class PragmaTokenizer:
         self.pad_token_id = self.vocab[self.masking_config.pad_token]
         self.mask_token_id = self.vocab[self.masking_config.mask_token]
         self.unk_token_id = self.vocab[self.masking_config.unk_token]
+        self.text_encoder = text_encoder or build_text_encoder(self.text_encoder_config)
+        self.text_placeholder_token_id: int | None = None
+        if self.text_encoder is not None:
+            self.text_placeholder_token_id = self.vocab.add(self.text_encoder_config.placeholder_token)
 
         self.field_types: dict[str, str] = {}
         self.key_token_ids: dict[str, int] = {}
         self.numeric_bucketizers: dict[str, NumericBucketizer] = {}
         self.categorical_value_ids: dict[str, dict[str, int]] = {}
         self.text_subword_ids: dict[str, int] = {}
+        self.external_text_fields: set[str] = set()
         self.bpe = BPETokenizer(
             vocab_size=self.config.text_vocab_size,
             min_frequency=self.config.bpe_min_frequency,
@@ -184,6 +214,12 @@ class PragmaTokenizer:
     @property
     def vocab_size(self) -> int:
         return len(self.vocab)
+
+    @property
+    def text_embedding_dim(self) -> int:
+        if self.text_encoder is None:
+            return 0
+        return int(self.text_encoder.output_dim)
 
     def fit(self, records: list[UserRecord | dict[str, Any]]) -> None:
         materialized = [self._ensure_record(record) for record in records]
@@ -243,7 +279,10 @@ class PragmaTokenizer:
                     token = f"cat:{field}:{value}"
                     self.categorical_value_ids[field][value] = self.vocab.add(token)
             else:
-                text_corpus.extend(string_values[field])
+                if self.text_encoder is not None and self.text_encoder.applies_to(field):
+                    self.external_text_fields.add(field)
+                else:
+                    text_corpus.extend(string_values[field])
 
             self.key_token_ids[field] = self.vocab.add(f"key:{field}")
 
@@ -263,6 +302,7 @@ class PragmaTokenizer:
         profile_key_ids: list[int] = []
         profile_value_ids: list[int] = []
         profile_positions: list[int] = []
+        profile_text_values: list[str | None] = []
         profile_times: list[float] = []
 
         for field, value in user_record.profile.items():
@@ -273,6 +313,7 @@ class PragmaTokenizer:
                 key_ids=profile_key_ids,
                 value_ids=profile_value_ids,
                 value_positions=profile_positions,
+                text_values=profile_text_values,
                 time_values=profile_times,
             )
 
@@ -288,6 +329,7 @@ class PragmaTokenizer:
                 key_ids=profile_key_ids,
                 value_ids=profile_value_ids,
                 value_positions=profile_positions,
+                text_values=profile_text_values,
                 time_values=profile_times,
             )
 
@@ -295,6 +337,7 @@ class PragmaTokenizer:
         profile_key_ids = profile_key_ids[:profile_limit]
         profile_value_ids = profile_value_ids[:profile_limit]
         profile_positions = profile_positions[:profile_limit]
+        profile_text_values = profile_text_values[:profile_limit]
         profile_times = profile_times[:profile_limit]
 
         sorted_events = sorted(user_record.events, key=lambda item: parse_timestamp(item.timestamp))
@@ -308,6 +351,7 @@ class PragmaTokenizer:
             key_ids: list[int] = []
             value_ids: list[int] = []
             value_positions: list[int] = []
+            text_values: list[str | None] = []
             time_gap = max(0.0, (last_event_ts - event_ts).total_seconds())
             for field, value in event.fields.items():
                 self._append_field_encoding(
@@ -317,6 +361,7 @@ class PragmaTokenizer:
                     key_ids=key_ids,
                     value_ids=value_ids,
                     value_positions=value_positions,
+                    text_values=text_values,
                     time_values=None,
                 )
 
@@ -325,6 +370,7 @@ class PragmaTokenizer:
                 key_ids = key_ids[:token_limit]
                 value_ids = value_ids[:token_limit]
                 value_positions = value_positions[:token_limit]
+                text_values = text_values[:token_limit]
             if not value_ids:
                 continue
             tokenized_events.append(
@@ -332,6 +378,7 @@ class PragmaTokenizer:
                     key_ids=key_ids,
                     value_ids=value_ids,
                     value_positions=value_positions,
+                    text_values=text_values,
                     history_time=self._soft_log_seconds(time_gap),
                     calendar_features=self._calendar_features(event_ts),
                 )
@@ -342,6 +389,7 @@ class PragmaTokenizer:
             profile_key_ids=profile_key_ids,
             profile_value_ids=profile_value_ids,
             profile_value_positions=profile_positions,
+            profile_text_values=profile_text_values,
             profile_times=profile_times,
             events=tokenized_events,
             label=user_record.label,
@@ -354,6 +402,7 @@ class PragmaTokenizer:
         apply_mlm: bool = True,
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
+        pack_events: bool = True,
     ) -> PragmaBatch:
         tokenized_records = [
             record if isinstance(record, TokenizedRecord) else self.tokenize_record(record)
@@ -386,7 +435,26 @@ class PragmaTokenizer:
         event_history_times = torch.zeros((batch_size, max_events), dtype=torch.float32)
         event_calendar_features = torch.zeros((batch_size, max_events, 6), dtype=torch.float32)
 
-        downstream_labels: torch.Tensor | None = None
+        profile_text_mask: torch.Tensor | None = None
+        profile_text_embeddings: torch.Tensor | None = None
+        event_text_mask: torch.Tensor | None = None
+        event_text_embeddings: torch.Tensor | None = None
+        profile_text_coords: list[tuple[int, int]] = []
+        profile_text_payloads: list[str] = []
+        event_text_coords: list[tuple[int, int, int]] = []
+        event_text_payloads: list[str] = []
+        if self.text_encoder is not None and self.text_embedding_dim > 0:
+            profile_text_mask = torch.zeros((batch_size, max_profile_tokens), dtype=torch.bool)
+            profile_text_embeddings = torch.zeros(
+                (batch_size, max_profile_tokens, self.text_embedding_dim),
+                dtype=torch.float32,
+            )
+            event_text_mask = torch.zeros(event_shape, dtype=torch.bool)
+            event_text_embeddings = torch.zeros(
+                event_shape + (self.text_embedding_dim,),
+                dtype=torch.float32,
+            )
+
         raw_labels = [record.label for record in tokenized_records]
 
         for batch_index, record in enumerate(tokenized_records):
@@ -406,6 +474,13 @@ class PragmaTokenizer:
                     record.profile_times, dtype=torch.float32
                 )
                 profile_token_mask[batch_index, :profile_length] = True
+                if profile_text_mask is not None:
+                    for token_index, text_value in enumerate(record.profile_text_values):
+                        if text_value is None:
+                            continue
+                        profile_text_mask[batch_index, token_index] = True
+                        profile_text_coords.append((batch_index, token_index))
+                        profile_text_payloads.append(text_value)
 
             for event_index, event in enumerate(record.events):
                 token_length = len(event.value_ids)
@@ -427,30 +502,67 @@ class PragmaTokenizer:
                 event_calendar_features[batch_index, event_index] = torch.tensor(
                     event.calendar_features, dtype=torch.float32
                 )
+                if event_text_mask is not None:
+                    for token_index, text_value in enumerate(event.text_values):
+                        if text_value is None:
+                            continue
+                        event_text_mask[batch_index, event_index, token_index] = True
+                        event_text_coords.append((batch_index, event_index, token_index))
+                        event_text_payloads.append(text_value)
 
-        if raw_labels and all(label is not None for label in raw_labels):
+        if self.text_encoder is not None:
+            if profile_text_payloads and profile_text_embeddings is not None:
+                encoded = self.text_encoder.encode(profile_text_payloads)
+                for vector, (batch_index, token_index) in zip(encoded, profile_text_coords):
+                    profile_text_embeddings[batch_index, token_index] = vector
+            if event_text_payloads and event_text_embeddings is not None:
+                encoded = self.text_encoder.encode(event_text_payloads)
+                for vector, (batch_index, event_index, token_index) in zip(encoded, event_text_coords):
+                    event_text_embeddings[batch_index, event_index, token_index] = vector
+
+        downstream_labels: torch.Tensor | None = None
+        if raw_labels and all(label is not None and not isinstance(label, dict) for label in raw_labels):
             first = raw_labels[0]
             if isinstance(first, (list, tuple)):
                 downstream_labels = torch.tensor(raw_labels, dtype=torch.float32)
             else:
                 downstream_labels = torch.tensor(raw_labels, dtype=torch.float32)
 
+        mlm_labels = torch.full_like(event_value_ids, fill_value=self.masking_config.ignore_index)
+        masked_event_value_ids = event_value_ids.clone()
+        mlm_text_target_mask: torch.Tensor | None = None
+        mlm_text_targets: torch.Tensor | None = None
         if apply_mlm and max_events > 0 and max_event_tokens > 0:
-            masked_event_value_ids, mlm_labels = build_mlm_inputs(
+            masked_event_value_ids, mlm_labels, mlm_text_target_mask = build_mlm_inputs(
                 event_value_ids=event_value_ids,
                 event_key_ids=event_key_ids,
                 event_token_mask=event_token_mask,
                 event_mask=event_mask,
+                event_text_mask=event_text_mask,
                 mask_token_id=self.mask_token_id,
                 unk_token_id=self.unk_token_id,
                 config=self.masking_config,
                 generator=generator,
             )
-        else:
-            masked_event_value_ids = event_value_ids.clone()
-            mlm_labels = torch.full_like(
-                event_value_ids, fill_value=self.masking_config.ignore_index
-            )
+            if event_text_embeddings is not None and mlm_text_target_mask is not None:
+                mlm_text_targets = event_text_embeddings.clone()
+
+        packed_event_key_ids: torch.Tensor | None = None
+        packed_event_value_ids: torch.Tensor | None = None
+        packed_masked_event_value_ids: torch.Tensor | None = None
+        packed_event_value_positions: torch.Tensor | None = None
+        packed_event_lengths: torch.Tensor | None = None
+        packed_event_text_mask: torch.Tensor | None = None
+        packed_event_text_embeddings: torch.Tensor | None = None
+        if pack_events and event_mask.any() and event_token_mask.any():
+            packed_event_lengths = event_token_mask.sum(dim=-1)[event_mask].to(torch.long)
+            packed_event_key_ids = event_key_ids[event_token_mask]
+            packed_event_value_ids = event_value_ids[event_token_mask]
+            packed_masked_event_value_ids = masked_event_value_ids[event_token_mask]
+            packed_event_value_positions = event_value_positions[event_token_mask]
+            if event_text_mask is not None and event_text_embeddings is not None:
+                packed_event_text_mask = event_text_mask[event_token_mask]
+                packed_event_text_embeddings = event_text_embeddings[event_token_mask]
 
         batch = PragmaBatch(
             profile_key_ids=profile_key_ids,
@@ -458,6 +570,8 @@ class PragmaTokenizer:
             profile_value_positions=profile_value_positions,
             profile_times=profile_times,
             profile_token_mask=profile_token_mask,
+            profile_text_mask=profile_text_mask,
+            profile_text_embeddings=profile_text_embeddings,
             event_key_ids=event_key_ids,
             event_value_ids=event_value_ids,
             masked_event_value_ids=masked_event_value_ids,
@@ -466,7 +580,18 @@ class PragmaTokenizer:
             event_calendar_features=event_calendar_features,
             event_token_mask=event_token_mask,
             event_mask=event_mask,
+            event_text_mask=event_text_mask,
+            event_text_embeddings=event_text_embeddings,
+            packed_event_key_ids=packed_event_key_ids,
+            packed_event_value_ids=packed_event_value_ids,
+            packed_masked_event_value_ids=packed_masked_event_value_ids,
+            packed_event_value_positions=packed_event_value_positions,
+            packed_event_lengths=packed_event_lengths,
+            packed_event_text_mask=packed_event_text_mask,
+            packed_event_text_embeddings=packed_event_text_embeddings,
             mlm_labels=mlm_labels,
+            mlm_text_target_mask=mlm_text_target_mask,
+            mlm_text_targets=mlm_text_targets,
             downstream_labels=downstream_labels,
         )
         if device is not None:
@@ -477,6 +602,7 @@ class PragmaTokenizer:
         payload = {
             "config": asdict(self.config),
             "masking_config": asdict(self.masking_config),
+            "text_encoder_config": asdict(self.text_encoder_config),
             "vocab": self.vocab.to_list(),
             "field_types": self.field_types,
             "key_token_ids": self.key_token_ids,
@@ -485,6 +611,7 @@ class PragmaTokenizer:
             },
             "categorical_value_ids": self.categorical_value_ids,
             "text_subword_ids": self.text_subword_ids,
+            "external_text_fields": sorted(self.external_text_fields),
             "bpe": self.bpe.to_dict(),
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -495,11 +622,14 @@ class PragmaTokenizer:
         tokenizer = cls(
             config=TokenizerConfig(**payload["config"]),
             masking_config=MaskingConfig(**payload["masking_config"]),
+            text_encoder_config=text_encoder_config_from_dict(payload.get("text_encoder_config")),
         )
         tokenizer.vocab = Vocabulary.from_list(payload["vocab"])
         tokenizer.pad_token_id = tokenizer.vocab[tokenizer.masking_config.pad_token]
         tokenizer.mask_token_id = tokenizer.vocab[tokenizer.masking_config.mask_token]
         tokenizer.unk_token_id = tokenizer.vocab[tokenizer.masking_config.unk_token]
+        placeholder_token = tokenizer.text_encoder_config.placeholder_token
+        tokenizer.text_placeholder_token_id = tokenizer.vocab.get(placeholder_token)
         tokenizer.field_types = {str(k): str(v) for k, v in payload["field_types"].items()}
         tokenizer.key_token_ids = {
             str(k): int(v) for k, v in payload["key_token_ids"].items()
@@ -515,6 +645,7 @@ class PragmaTokenizer:
         tokenizer.text_subword_ids = {
             str(k): int(v) for k, v in payload["text_subword_ids"].items()
         }
+        tokenizer.external_text_fields = {str(item) for item in payload.get("external_text_fields", [])}
         tokenizer.bpe = BPETokenizer.from_dict(payload["bpe"])
         return tokenizer
 
@@ -549,43 +680,46 @@ class PragmaTokenizer:
         key_ids: list[int],
         value_ids: list[int],
         value_positions: list[int],
+        text_values: list[str | None],
         time_values: list[float] | None,
     ) -> None:
         if field not in self.field_types:
             return
-        encoded_values = self._encode_value_ids(field, value)
+        encoded_values = self._encode_value_pieces(field, value)
         if not encoded_values:
             return
         key_id = self.key_token_ids[field]
-        start = len(key_ids)
-        for offset, value_id in enumerate(encoded_values):
+        for offset, (value_id, text_value) in enumerate(encoded_values):
             key_ids.append(key_id)
             value_ids.append(value_id)
             value_positions.append(offset)
+            text_values.append(text_value)
             if time_values is not None:
                 time_values.append(time_value)
-        if start == len(key_ids):
-            return
 
-    def _encode_value_ids(self, field: str, value: Any) -> list[int]:
+    def _encode_value_pieces(self, field: str, value: Any) -> list[tuple[int, str | None]]:
         field_type = self.field_types[field]
-        encoded: list[int] = []
+        encoded: list[tuple[int, str | None]] = []
         for item in ensure_list(value):
             if field_type == "numeric":
                 bucketizer = self.numeric_bucketizers[field]
                 bucket_index = bucketizer.bucket_index(float(item))
                 token = f"num:{field}:{bucket_index}"
-                encoded.append(self.vocab[token])
+                encoded.append((self.vocab[token], None))
             elif field_type == "categorical":
                 mapping = self.categorical_value_ids[field]
-                encoded.append(mapping.get(str(item), self.unk_token_id))
+                encoded.append((mapping.get(str(item), self.unk_token_id), None))
+            elif field in self.external_text_fields:
+                if self.text_placeholder_token_id is None:
+                    raise RuntimeError("Text placeholder token is missing.")
+                encoded.append((self.text_placeholder_token_id, str(item)))
             else:
                 subwords = self.bpe.encode(str(item))
                 if not subwords:
-                    encoded.append(self.unk_token_id)
+                    encoded.append((self.unk_token_id, None))
                 else:
                     for subword in subwords:
-                        encoded.append(self.text_subword_ids.get(subword, self.unk_token_id))
+                        encoded.append((self.text_subword_ids.get(subword, self.unk_token_id), None))
         return encoded
 
     def _calendar_features(self, timestamp) -> list[float]:

@@ -47,6 +47,19 @@ class MaskingConfig:
 
 
 @dataclass(slots=True)
+class TextEncoderConfig:
+    enabled: bool = False
+    provider: str = "hash"
+    model_name: str | None = None
+    output_dim: int = 384
+    max_length: int = 128
+    local_files_only: bool = True
+    placeholder_token: str = "[TEXT]"
+    target_fields: tuple[str, ...] = field(default_factory=tuple)
+    text_loss_weight: float = 1.0
+
+
+@dataclass(slots=True)
 class ModelConfig:
     vocab_size: int
     d_model: int
@@ -58,6 +71,8 @@ class ModelConfig:
     dropout: float = 0.1
     max_event_tokens: int = 24
     label_smoothing: float = 0.1
+    text_encoder_dim: int = 0
+    text_loss_weight: float = 1.0
 
 
 MODEL_VARIANTS: dict[str, dict[str, int]] = {
@@ -95,6 +110,8 @@ def make_model_config(
     dropout: float = 0.1,
     label_smoothing: float = 0.1,
     max_event_tokens: int = 24,
+    text_encoder_dim: int = 0,
+    text_loss_weight: float = 1.0,
 ) -> ModelConfig:
     variant_key = variant.upper()
     if variant_key not in MODEL_VARIANTS:
@@ -112,6 +129,8 @@ def make_model_config(
         dropout=dropout,
         max_event_tokens=max_event_tokens,
         label_smoothing=label_smoothing,
+        text_encoder_dim=text_encoder_dim,
+        text_loss_weight=text_loss_weight,
     )
 
 
@@ -133,3 +152,10 @@ def tokenizer_config_from_dict(payload: dict[str, Any] | None = None) -> Tokeniz
 
 def masking_config_from_dict(payload: dict[str, Any] | None = None) -> MaskingConfig:
     return MaskingConfig(**dict(payload or {}))
+
+
+def text_encoder_config_from_dict(payload: dict[str, Any] | None = None) -> TextEncoderConfig:
+    data = dict(payload or {})
+    if "target_fields" in data:
+        data["target_fields"] = tuple(data["target_fields"])
+    return TextEncoderConfig(**data)
