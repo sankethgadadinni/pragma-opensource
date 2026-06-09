@@ -73,6 +73,45 @@ class ModelConfig:
     label_smoothing: float = 0.1
     text_encoder_dim: int = 0
     text_loss_weight: float = 1.0
+    attention_backend: str = "auto"
+
+
+@dataclass(slots=True)
+class DistributedConfig:
+    enabled: bool = False
+    backend: str = "nccl"
+    find_unused_parameters: bool = False
+    broadcast_buffers: bool = False
+
+
+@dataclass(slots=True)
+class CheckpointConfig:
+    save_every: int = 0
+    keep_last: int = 2
+    resume_path: str | None = None
+
+
+@dataclass(slots=True)
+class RuntimeConfig:
+    seed: int = 0
+    device: str = "auto"
+    deterministic: bool = False
+    compile: bool = False
+    matmul_precision: str = "high"
+    log_every: int = 1
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
+
+
+@dataclass(slots=True)
+class BenchmarkConfig:
+    batch_size: int = 8
+    steps: int = 10
+    warmup_steps: int = 2
+    num_records: int = 128
+    backends: tuple[str, ...] = ("auto", "sdpa", "manual")
+    pack_events: tuple[bool, ...] = (True, False)
+    output_path: str = "artifacts/benchmark/results.json"
 
 
 MODEL_VARIANTS: dict[str, dict[str, int]] = {
@@ -112,6 +151,7 @@ def make_model_config(
     max_event_tokens: int = 24,
     text_encoder_dim: int = 0,
     text_loss_weight: float = 1.0,
+    attention_backend: str = "auto",
 ) -> ModelConfig:
     variant_key = variant.upper()
     if variant_key not in MODEL_VARIANTS:
@@ -131,6 +171,7 @@ def make_model_config(
         label_smoothing=label_smoothing,
         text_encoder_dim=text_encoder_dim,
         text_loss_weight=text_loss_weight,
+        attention_backend=attention_backend,
     )
 
 
@@ -159,3 +200,27 @@ def text_encoder_config_from_dict(payload: dict[str, Any] | None = None) -> Text
     if "target_fields" in data:
         data["target_fields"] = tuple(data["target_fields"])
     return TextEncoderConfig(**data)
+
+
+def distributed_config_from_dict(payload: dict[str, Any] | None = None) -> DistributedConfig:
+    return DistributedConfig(**dict(payload or {}))
+
+
+def checkpoint_config_from_dict(payload: dict[str, Any] | None = None) -> CheckpointConfig:
+    return CheckpointConfig(**dict(payload or {}))
+
+
+def runtime_config_from_dict(payload: dict[str, Any] | None = None) -> RuntimeConfig:
+    data = dict(payload or {})
+    data["distributed"] = distributed_config_from_dict(data.get("distributed"))
+    data["checkpointing"] = checkpoint_config_from_dict(data.get("checkpointing"))
+    return RuntimeConfig(**data)
+
+
+def benchmark_config_from_dict(payload: dict[str, Any] | None = None) -> BenchmarkConfig:
+    data = dict(payload or {})
+    if "backends" in data:
+        data["backends"] = tuple(data["backends"])
+    if "pack_events" in data:
+        data["pack_events"] = tuple(bool(item) for item in data["pack_events"])
+    return BenchmarkConfig(**data)

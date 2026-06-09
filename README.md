@@ -11,6 +11,9 @@ This repo contains a clean-room PyTorch implementation of the PRAGMA recipe from
 - LMDB-backed user index plus Parquet event shards for pretraining
 - dynamic token-budget batching with packed event processing
 - Muon + AdamW pretraining split with configurable bf16 autocast
+- resumable checkpoints with deterministic step seeding
+- optional single-node DDP via `torchrun`
+- selectable attention backends (`auto`, `sdpa`, `flash`, `manual`)
 - LoRA adapters over QKV and MLP projections for downstream tuning
 - LBFGS embedding probes with standard-scaling
 - binary, regression, ranking, and uplift-style downstream evaluation
@@ -28,11 +31,12 @@ The implementation is still pragmatic in a few places:
 - `environment.yml`: Conda environment definition
 - `config.yaml`: shared runtime, training, and inference settings
 - `src/config.py`: model presets plus YAML config loading helpers
+- `src/runtime.py`: runtime, checkpointing, and DDP helpers
 - `src/data/`: records, tokenization, masking, JSON I/O, shard storage, and synthetic data generation
 - `src/modeling/`: backbone, LoRA, and optimizer modules
 - `src/tasks/`: probe fitting, label handling, and metrics
-- `src/tests/`: smoke-level execution checks
-- `scripts/`: store building, training, probing, and inference entrypoints
+- `src/tests/`: smoke and end-to-end integration checks
+- `scripts/`: store building, training, benchmarking, probing, and inference entrypoints
 - `research/`: local paper notes and ignored research assets
 
 ## Record Schema
@@ -51,9 +55,11 @@ Each training example is a `UserRecord` with:
 conda env create -f environment.yml
 conda activate pragma-opensource
 python src/tests/smoke_test.py
+python src/tests/integration_test.py
 python scripts/build_store.py --config config.yaml
 python scripts/train.py --config config.yaml --task pretrain
 python scripts/train.py --config config.yaml --task finetune
+python scripts/benchmark.py --config config.yaml
 python scripts/probe.py --config config.yaml
 python scripts/infer.py --config config.yaml
 ```
@@ -63,15 +69,17 @@ python scripts/infer.py --config config.yaml
 `config.yaml` is the single control surface for:
 
 - runtime device and random seed
+- runtime checkpointing, logging cadence, and distributed settings
 - dataset source, shard storage, and synthetic dataset size
 - tokenizer settings
 - optional frozen text encoder settings
-- model variant and dropout
+- model variant, dropout, and attention backend
 - pretraining hyperparameters, shard batching, and output paths
+- benchmark combinations for packed vs. unpacked attention
 - finetuning, probe, and LoRA settings
 - inference checkpoint paths and prediction output
 
-That means you can switch between in-memory records and sharded pretraining, change downstream task types, or enable the text-encoder ablation without editing Python files.
+That means you can switch between in-memory records and sharded pretraining, change downstream task types, resume from checkpoints, benchmark backend choices, or enable the text-encoder ablation without editing Python files.
 
 ## Paper-Faithful Defaults
 
@@ -89,7 +97,22 @@ That means you can switch between in-memory records and sharded pretraining, cha
 ## Training Paths
 
 - `scripts/build_store.py` builds the LMDB + Parquet pretraining store.
-- `scripts/train.py --task pretrain` runs the masked-model pretraining path with Muon + AdamW or plain AdamW.
-- `scripts/train.py --task finetune` runs LoRA fine-tuning for `binary`, `regression`, `ranking`, or `multiclass` tasks.
+- `scripts/train.py --task pretrain` runs the masked-model pretraining path with Muon + AdamW or plain AdamW, periodic checkpoints, and resume support.
+- `scripts/train.py --task finetune` runs LoRA fine-tuning for `binary`, `regression`, `ranking`, or `multiclass` tasks with the same checkpoint/resume path.
+- `scripts/benchmark.py` measures packed-event throughput across attention backends.
 - `scripts/probe.py` runs frozen embedding probes, including uplift evaluation.
 - `scripts/infer.py` loads a fine-tuned checkpoint and writes predictions to JSON.
+
+## Resume And DDP
+
+Resume from the latest local checkpoint:
+
+```bash
+python scripts/train.py --config config.yaml --task pretrain --resume artifacts/pretrain/checkpoints/pretrain_latest.pt
+```
+
+Run single-node distributed pretraining:
+
+```bash
+torchrun --nproc_per_node=4 scripts/train.py --config config.yaml --task pretrain
+```

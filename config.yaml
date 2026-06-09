@@ -1,6 +1,19 @@
 runtime:
   seed: 0
   device: auto
+  deterministic: false
+  compile: false
+  matmul_precision: high
+  log_every: 1
+  distributed:
+    enabled: false
+    backend: nccl
+    find_unused_parameters: false
+    broadcast_buffers: false
+  checkpointing:
+    save_every: 5
+    keep_last: 2
+    resume_path: null
 
 data:
   source: synthetic
@@ -55,6 +68,7 @@ text_encoder:
 model:
   variant: S
   dropout: 0.1
+  attention_backend: auto
 
 pretrain:
   batch_size: 8
@@ -117,3 +131,17 @@ probe:
   synthetic_seed: 11
   num_records: 256
   output_path: artifacts/probe/results.json
+
+benchmark:
+  batch_size: 8
+  steps: 10
+  warmup_steps: 2
+  num_records: 128
+  backends:
+    - auto
+    - sdpa
+    - manual
+  pack_events:
+    - true
+    - false
+  output_path: artifacts/benchmark/results.json

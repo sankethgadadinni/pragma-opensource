@@ -18,16 +18,22 @@ def build_mlm_inputs(
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     device = event_value_ids.device
-    if generator is None:
-        generator = torch.Generator(device=device)
+    def rand(shape, *, scalar: bool = False) -> torch.Tensor:
+        if generator is None:
+            if scalar:
+                return torch.rand((), device=device)
+            return torch.rand(shape, device=device)
+        if scalar:
+            return torch.rand((), device=device, generator=generator)
+        return torch.rand(shape, device=device, generator=generator)
 
     valid_tokens = event_token_mask.bool()
     selected = torch.zeros_like(valid_tokens)
 
-    token_draw = torch.rand(event_value_ids.shape, device=device, generator=generator)
+    token_draw = rand(event_value_ids.shape)
     selected |= valid_tokens & (token_draw < config.token_mask_probability)
 
-    event_draw = torch.rand(event_mask.shape, device=device, generator=generator)
+    event_draw = rand(event_mask.shape)
     selected_events = event_draw < config.event_mask_probability
     selected |= valid_tokens & selected_events.unsqueeze(-1)
 
@@ -35,7 +41,7 @@ def build_mlm_inputs(
     for batch_index in range(batch_size):
         present_keys = torch.unique(event_key_ids[batch_index][valid_tokens[batch_index]])
         for key_id in present_keys.tolist():
-            key_draw = torch.rand((), device=device, generator=generator)
+            key_draw = rand((), scalar=True)
             if key_draw.item() < config.key_mask_probability:
                 selected[batch_index] |= valid_tokens[batch_index] & (
                     event_key_ids[batch_index] == key_id
@@ -49,7 +55,7 @@ def build_mlm_inputs(
             text_target_mask = torch.zeros_like(event_text_mask, dtype=torch.bool)
         return masked_value_ids, labels, text_target_mask
 
-    unk_draw = torch.rand(event_value_ids.shape, device=device, generator=generator)
+    unk_draw = rand(event_value_ids.shape)
     use_unk = selected & (unk_draw < config.unk_probability)
     use_mask = selected & ~use_unk
 

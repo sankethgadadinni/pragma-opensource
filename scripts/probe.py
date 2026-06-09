@@ -87,6 +87,7 @@ def main() -> None:
             max_event_tokens=int(checkpoint.get("max_event_tokens", tokenizer.config.max_event_tokens)),
             text_encoder_dim=int(checkpoint.get("text_encoder_dim", tokenizer.text_embedding_dim)),
             text_loss_weight=float(checkpoint.get("text_loss_weight", config.get("text_encoder", {}).get("text_loss_weight", 1.0))),
+            attention_backend=str(checkpoint.get("attention_backend", config.get("model", {}).get("attention_backend", "auto"))),
         )
     ).to(device)
     backbone.load_state_dict(checkpoint["state_dict"], strict=False)

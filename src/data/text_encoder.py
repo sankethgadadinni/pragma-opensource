@@ -95,3 +95,38 @@ def build_text_encoder(config: TextEncoderConfig | None) -> FrozenTextEncoder | 
     if provider == "hf":
         return HuggingFaceTextEncoder(config)
     raise ValueError(f"Unsupported text encoder provider: {config.provider!r}")
+
+
+def validate_frozen_text_encoder(
+    encoder: FrozenTextEncoder | None,
+    *,
+    sample_texts: list[str] | None = None,
+) -> dict[str, object]:
+    if encoder is None:
+        return {"enabled": False, "provider": None, "output_dim": 0, "num_samples": 0}
+
+    texts = sample_texts or [
+        "merchant payment at weekly grocery store",
+        "salary transfer for monthly payroll",
+    ]
+    encoded = encoder.encode(texts)
+    if encoded.ndim != 2:
+        raise RuntimeError(f"Expected 2D text embeddings, received shape={tuple(encoded.shape)}.")
+    if encoded.shape[0] != len(texts):
+        raise RuntimeError(
+            f"Expected one embedding per sample text, received {encoded.shape[0]} for {len(texts)} inputs."
+        )
+    if encoded.shape[1] != encoder.output_dim:
+        raise RuntimeError(
+            f"Text encoder output dim mismatch: expected {encoder.output_dim}, received {encoded.shape[1]}."
+        )
+    if encoded.dtype != torch.float32:
+        raise RuntimeError(f"Expected float32 text embeddings, received {encoded.dtype}.")
+    if not torch.isfinite(encoded).all():
+        raise RuntimeError("Text encoder produced non-finite values.")
+    return {
+        "enabled": True,
+        "provider": encoder.config.provider,
+        "output_dim": int(encoder.output_dim),
+        "num_samples": len(texts),
+    }

@@ -19,7 +19,7 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["config"]
+py-modules = ["config", "runtime"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

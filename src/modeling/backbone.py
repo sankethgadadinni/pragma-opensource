@@ -11,6 +11,8 @@ from torch.nn import functional as F
 from config import ModelConfig
 from data.tokenizer import PragmaBatch
 
+from .varlen import apply_attention
+
 
 def sinusoidal_embedding(indices: torch.Tensor, dim: int) -> torch.Tensor:
     if indices.numel() == 0:
@@ -60,13 +62,20 @@ def apply_continuous_rope(
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float,
+        attention_backend: str = "auto",
+    ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.attention_backend = attention_backend
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -86,14 +95,15 @@ class SelfAttention(nn.Module):
         if rope_positions is not None:
             query, key = apply_continuous_rope(query, key, rope_positions)
 
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if valid_mask is not None:
-            key_mask = valid_mask[:, None, None, :]
-            scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
-
-        attention = torch.softmax(scores, dim=-1)
-        attention = self.dropout(attention)
-        output = torch.matmul(attention, value)
+        output, _ = apply_attention(
+            query,
+            key,
+            value,
+            requested_backend=self.attention_backend,
+            valid_mask=valid_mask,
+            dropout_p=self.dropout.p,
+            training=self.training,
+        )
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.proj(output)
         output = self.dropout(output)
@@ -118,11 +128,23 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, d_ffn: int, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        d_ffn: int,
+        num_heads: int,
+        dropout: float,
+        attention_backend: str = "auto",
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.attention = SelfAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
+        self.attention = SelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            attention_backend=attention_backend,
+        )
         self.ffn = FeedForward(d_model=d_model, d_ffn=d_ffn, dropout=dropout)
 
     def forward(
@@ -149,6 +171,7 @@ class TransformerEncoder(nn.Module):
         d_ffn: int,
         num_heads: int,
         dropout: float,
+        attention_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -158,6 +181,7 @@ class TransformerEncoder(nn.Module):
                     d_ffn=d_ffn,
                     num_heads=num_heads,
                     dropout=dropout,
+                    attention_backend=attention_backend,
                 )
                 for _ in range(depth)
             ]
@@ -225,6 +249,7 @@ class PragmaBackbone(nn.Module):
             d_ffn=config.d_ffn,
             num_heads=config.num_heads,
             dropout=config.dropout,
+            attention_backend=config.attention_backend,
         )
         self.event_encoder = TransformerEncoder(
             depth=config.event_layers,
@@ -232,6 +257,7 @@ class PragmaBackbone(nn.Module):
             d_ffn=config.d_ffn,
             num_heads=config.num_heads,
             dropout=config.dropout,
+            attention_backend=config.attention_backend,
         )
         self.history_encoder = TransformerEncoder(
             depth=config.history_layers,
@@ -239,6 +265,7 @@ class PragmaBackbone(nn.Module):
             d_ffn=config.d_ffn,
             num_heads=config.num_heads,
             dropout=config.dropout,
+            attention_backend=config.attention_backend,
         )
         self.calendar_encoder = CalendarFeatureEncoder(config.d_model, config.dropout)
         self.mlm_projection = nn.Linear(3 * config.d_model, config.d_model)
