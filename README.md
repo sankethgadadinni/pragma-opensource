@@ -33,6 +33,7 @@ The implementation is still pragmatic in a few places:
 - `src/config.py`: model presets plus YAML config loading helpers
 - `src/runtime.py`: runtime, checkpointing, and DDP helpers
 - `src/data/`: records, tokenization, masking, JSON I/O, shard storage, and synthetic data generation
+- `src/data/mbd.py`: MBD and MBD-mini loader that maps public multimodal banking tables into `UserRecord`s
 - `src/modeling/`: backbone, LoRA, and optimizer modules
 - `src/tasks/`: probe fitting, label handling, and metrics
 - `src/tests/`: smoke and end-to-end integration checks
@@ -71,6 +72,7 @@ python scripts/infer.py --config config.yaml
 - runtime device and random seed
 - runtime checkpointing, logging cadence, and distributed settings
 - dataset source, shard storage, and synthetic dataset size
+- MBD/MBD-mini root paths, fold filters, target attachment, and dialog embedding compression
 - tokenizer settings
 - optional frozen text encoder settings
 - model variant, dropout, and attention backend
@@ -80,6 +82,42 @@ python scripts/infer.py --config config.yaml
 - inference checkpoint paths and prediction output
 
 That means you can switch between in-memory records and sharded pretraining, change downstream task types, resume from checkpoints, benchmark backend choices, or enable the text-encoder ablation without editing Python files.
+
+## MBD Loader
+
+The repo now has a first-class `data.source: mbd` path for `MBD` and `MBD-mini`.
+
+- one `UserRecord` is built per `(client_id, report_date)` cutoff
+- transactions, geo rows, and dialog rows are merged into one time-ordered event history
+- profile state is derived from the history window, including recent transaction counts, amount aggregates, dominant currency, geo activity, and dialog recency
+- milestone-style `lifelong` events are derived from first transaction, geo, and dialog timestamps
+- multi-product targets can stay attached as a label vector for downstream ranking, or be disabled with `attach_targets: false` for pure pretraining
+- dialog embeddings are compacted with either `summary`, `project`, or `skip` strategies so they fit the tokenizer cleanly
+
+Example config snippet:
+
+```yaml
+data:
+  source: mbd
+  train_fraction: 0.8
+  mbd:
+    root_dir: /path/to/mbd-mini
+    allowed_folds: [0]
+    label_fields: [product_1, product_2, product_3, product_4]
+    label_mode: vector
+    history_window_days: 365
+    dialog_embedding_strategy: project
+    dialog_projection_dim: 8
+    attach_targets: true
+```
+
+Then run the normal flow:
+
+```bash
+python scripts/build_store.py --config config.yaml
+python scripts/train.py --config config.yaml --task pretrain
+python scripts/probe.py --config config.yaml
+```
 
 ## Paper-Faithful Defaults
 

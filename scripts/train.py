@@ -30,6 +30,7 @@ from data import (  # noqa: E402
     TokenizedRecord,
     build_sharded_store,
     generate_synthetic_records,
+    load_mbd_records,
     load_user_records,
     split_records,
     validate_frozen_text_encoder,
@@ -265,6 +266,8 @@ def maybe_compile(module: torch.nn.Module, enabled: bool) -> torch.nn.Module:
 def load_records(config: dict) -> list:
     data_config = config.get("data", {})
     source = data_config.get("source", "synthetic")
+    if source == "mbd":
+        return load_mbd_records(data_config.get("mbd", {}), resolve_path=resolve_path)
     if source == "json":
         records_json = data_config.get("records_json")
         if not records_json:

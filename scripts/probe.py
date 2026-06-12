@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from config import load_yaml_config, make_model_config  # noqa: E402
-from data import PragmaTokenizer, ShardedRecordStore, generate_synthetic_records, load_user_records, split_records  # noqa: E402
+from data import PragmaTokenizer, ShardedRecordStore, generate_synthetic_records, load_mbd_records, load_user_records, split_records  # noqa: E402
 from modeling import PragmaBackbone  # noqa: E402
 from tasks import (  # noqa: E402
     StandardScaler,
@@ -45,9 +45,17 @@ def resolve_path(path_like: str | Path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def merged_mbd_config(config: dict, section_name: str) -> dict:
+    merged = dict(config.get("data", {}).get("mbd", {}))
+    merged.update(config.get(section_name, {}).get("mbd", {}))
+    return merged
+
+
 def load_records(config: dict) -> list:
     probe = config.get("probe", {})
     data_source = str(probe.get("source", config.get("data", {}).get("source", "synthetic")))
+    if data_source == "mbd":
+        return load_mbd_records(merged_mbd_config(config, "probe"), resolve_path=resolve_path)
     if data_source == "json":
         input_json = probe.get("input_json", config.get("data", {}).get("records_json"))
         if not input_json:

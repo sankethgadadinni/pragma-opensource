@@ -24,6 +24,25 @@ data:
   synthetic_seed: 0
   min_events: 16
   max_events: 72
+  mbd:
+    root_dir: null
+    targets_path: null
+    transactions_path: null
+    geo_path: null
+    dialogs_path: null
+    allowed_folds: []
+    label_fields: null
+    label_mode: auto
+    attach_targets: true
+    history_window_days: 365
+    dialog_embedding_strategy: project
+    dialog_projection_dim: 8
+    dialog_seed: 0
+    max_clients: 0
+    max_records: 0
+    shuffle_targets: false
+    sample_seed: 0
+    drop_empty_records: false
 
 tokenizer:
   categorical_threshold: 128
@@ -110,6 +129,7 @@ inference:
   source: synthetic
   input_json: null
   sharded_store_dir: null
+  mbd: {}
   task_type: binary
   num_examples: 5
   synthetic_seed: 7
@@ -123,6 +143,7 @@ probe:
   source: synthetic
   input_json: null
   sharded_store_dir: null
+  mbd: {}
   task_type: binary
   pooling: usr_last
   batch_size: 32

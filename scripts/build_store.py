@@ -20,6 +20,7 @@ from data import (  # noqa: E402
     PragmaTokenizer,
     build_sharded_store,
     generate_synthetic_records,
+    load_mbd_records,
     load_user_records,
     split_records,
 )
@@ -43,13 +44,15 @@ def maybe_copy_config(config_path: Path, output_dir: Path) -> None:
 def load_records(config: dict) -> list:
     data_config = config.get("data", {})
     source = data_config.get("source", "synthetic")
+    if source == "mbd":
+        return load_mbd_records(data_config.get("mbd", {}), resolve_path=resolve_path)
     if source == "json":
         records_json = data_config.get("records_json")
         if not records_json:
             raise ValueError("data.records_json must be set when data.source=json.")
         return load_user_records(resolve_path(records_json))
     if source != "synthetic":
-        raise ValueError("build_store.py supports synthetic or json sources.")
+        raise ValueError("build_store.py supports synthetic, json, or mbd sources.")
     return generate_synthetic_records(
         int(data_config.get("num_records", 256)),
         seed=int(data_config.get("synthetic_seed", 0)),

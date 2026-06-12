@@ -1,4 +1,5 @@
 from .io import load_user_records, save_json
+from .mbd import load_mbd_records
 from .records import EventRecord, LifelongEvent, UserRecord
 from .shards import ShardedRecordStore, build_sharded_store
 from .synthetic import generate_synthetic_records, split_records
@@ -17,6 +18,7 @@ __all__ = [
     "build_text_encoder",
     "generate_synthetic_records",
     "load_user_records",
+    "load_mbd_records",
     "save_json",
     "split_records",
     "validate_frozen_text_encoder",
